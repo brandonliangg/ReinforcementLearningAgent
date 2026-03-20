@@ -2,12 +2,6 @@
 
 ![visualization](media/sneaky_enemies.gif "Sneaky Enemies sample layout")
 
-## Overview
-
-Environment created for the students of the Reinforcement Learning course (CISC 474) of Winter 2025 at Queen's 
-University, taught by Prof. Sidney Givigi. As their course project, students must train an agent in the environment, 
-modifying the observation space and doing reward shaping to achieve a robust agent that covers diverse maps quickly.
-
 ## Installation
 
 To install the environment, simply run: 
@@ -34,7 +28,7 @@ There are three ways of defining the map layouts to be used:
 
 ### Standard maps
 
-Three standard maps are included in the `\coverage_gridworld\__init.py__` file: 
+Five standard maps are included in the `\coverage_gridworld\__init.py__` file: 
 - `just_go`: very easy difficulty map, 0 enemies and barely any walls, a simple validation test for algorithms,
 - `safe`: easy difficulty map, 0 enemies and many walls,
 - `maze`: medium difficulty map, 2 enemies and focuses mostly on movement,
@@ -42,7 +36,7 @@ Three standard maps are included in the `\coverage_gridworld\__init.py__` file:
 - `sneaky_enemies`: very hard difficulty map, 5 enemies and many walls, with some cells being surveilled by multiple 
 enemies.
 
-The standard maps can be used by using their tag on `gymnasium.make()`. For example:
+The standard maps can be employed by using their tag on `gymnasium.make()`. For example:
 
 ```python
 gymnasium.make("sneaky_enemies", render_mode="human", predefined_map_list=None)
@@ -108,14 +102,14 @@ The transitions are deterministic.
 ### Rewards
 The reward scheme must be implemented on the `custom.py` file, penalizing or rewarding certain
 behaviors (e.g. hitting a wall, not moving, walking over an explored cell, etc.). The `info` dictionary returned
-by the step method may be used for that.
+by the step method may be used for that. Note that not all values within the `info` dictionary need to be used.
 
 ### Episode End
 
 By default, an episode ends if any of the following happens:
 - The player dies (gets spotted by an enemy),
 - Explores all tiles,
-- Time runs out.
+- Time runs out (500 steps are taken).
 
 
 ## Testing
@@ -126,3 +120,25 @@ Two functions are provided within `main.py` for quick testing of the environment
 * `random_player()`, for quick visualization of a randomized policy.
 
 Both functions return the `action` variable that can be used with the `step()` function of the environment.
+
+## RL Training (Stable-Baselines3 PPO)
+
+You can train a PPO agent with Stable-Baselines3 using the helper script:
+
+```bash
+pip install stable-baselines3[extra] torch
+python train_sb3.py --env-id sneaky_enemies --timesteps 100000
+```
+
+Useful flags:
+
+```bash
+python train_sb3.py --reward-mode explore --obs-mode full_grid
+python train_sb3.py --reward-mode hidden --obs-mode partial_grid --partial-radius 2
+```
+
+Outputs (model + TensorBoard logs) are written to:
+
+```bash
+runs/ppo_coverage_gridworld/
+```
