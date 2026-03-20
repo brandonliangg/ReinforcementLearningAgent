@@ -7,6 +7,11 @@ from gymnasium.error import DependencyNotInstalled
 from typing import Optional
 from coverage_gridworld.custom import observation_space, observation, reward
 
+"""
+THIS FILE SHOULD NOT BE MODIFIED! USE IT ONLY FOR UNDERSTANDING HOW THE ENVIRONMENT WORKS.
+"""
+
+
 # action IDs
 LEFT = 0
 DOWN = 1
@@ -382,8 +387,8 @@ class CoverageGridworld(gym.Env):
                     # if the cell was either WHITE or GREY, then it becomes LIGHT_RED
                     self.grid[fov_row, fov_col] = np.asarray(LIGHT_RED)
                 elif self._is_color_in_cell(LIGHT_RED, fov_row, fov_col):
-                    # if the cell was LIGHT_RED, then it becomes WHITE
-                    self.grid[fov_row, fov_col] = np.asarray(WHITE)
+                    # if the cell was LIGHT_RED, then it does not change color
+                    self.grid[fov_row, fov_col] = np.asarray(LIGHT_RED)
                 else:
                     # if the cell was BLACK, then it becomes RED
                     self.grid[fov_row, fov_col] = np.asarray(RED)
