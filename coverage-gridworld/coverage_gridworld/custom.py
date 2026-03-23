@@ -18,10 +18,11 @@ _ENV_REFERENCE = None
 
 
 def set_observation_mode(mode: str):
-    """Set observation mode to 'full_grid' or 'partial_grid' via environment variable."""
+    """Set observation mode. Valid: 'full_grid', 'partial_grid', 'encoded_grid', 'encoded_with_pos'."""
     mode = str(mode).lower().strip()
-    if mode not in ["full_grid", "partial_grid"]:
-        raise ValueError("Unsupported observation mode. Choose 'full_grid' or 'partial_grid'.")
+    valid = ["full_grid", "partial_grid", "encoded_grid", "encoded_with_pos"]
+    if mode not in valid:
+        raise ValueError(f"Unsupported observation mode. Choose one of: {valid}")
     os.environ[_OBSERVATION_MODE_ENV_VAR] = mode
 
 def _get_observation_mode() -> str:
@@ -58,6 +59,36 @@ def _get_reward_mode() -> str:
         return _DEFAULT_REWARD_MODE
     return mode
 
+
+# ── Encoded-observation helpers ─────────────────────────────────────────────
+
+def _encode_grid(grid: np.ndarray) -> np.ndarray:
+    """Convert (H,W,3) RGB grid to (H,W,1) float32 cell-type IDs normalised to [0,1]."""
+    g = grid.astype(np.int32)
+    ids = np.zeros((grid.shape[0], grid.shape[1], 1), dtype=np.float32)
+    ids[np.all(g == [255, 255, 255], axis=2), 0] = 1   # WHITE   – explored
+    ids[np.all(g == [101,  67,  33], axis=2), 0] = 2   # BROWN   – wall
+    ids[np.all(g == [160, 161, 161], axis=2), 0] = 3   # GREY    – agent
+    ids[np.all(g == [ 31, 198,   0], axis=2), 0] = 4   # GREEN   – enemy
+    ids[np.all(g == [255,   0,   0], axis=2), 0] = 5   # RED     – unexp+FOV
+    ids[np.all(g == [255, 127, 127], axis=2), 0] = 6   # LIGHT   – exp+FOV
+    return ids / 6.0
+
+
+def _encode_grid_with_pos(grid: np.ndarray) -> np.ndarray:
+    """Flat float32 array: 100 encoded cell IDs + normalised (col, row, steps)."""
+    flat = _encode_grid(grid).flatten()
+    if _ENV_REFERENCE is not None:
+        env = _ENV_REFERENCE
+        col = (env.agent_pos % env.grid_size) / max(env.grid_size - 1, 1)
+        row = (env.agent_pos // env.grid_size) / max(env.grid_size - 1, 1)
+        steps = env.steps_remaining / 500.0
+    else:
+        col, row, steps = 0.0, 0.0, 1.0
+    return np.concatenate([flat, [col, row, steps]]).astype(np.float32)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 def observation_space(env: gym.Env) -> gym.spaces.Space:
     """
@@ -103,9 +134,15 @@ def observation_space(env: gym.Env) -> gym.spaces.Space:
         #shape = The shape of the observation. For a full RGB grid, this would be (grid_size, grid_size, 3). For a partial window, this would be (window, window, 3).
         #dtype = The data type of the observation. For RGB values, this is typically np.uint8, which allows values from 0 to 255.
 
-    # CASE 2: FULL MODE (default) - agent sees entire map
-    # Shape: (grid_size, grid_size, 3) = (10, 10, 3) for full RGB grid
-    # Values: 0-255 (standard RGB byte range)
+    # CASE 2: ENCODED GRID – cell-type IDs normalised to [0,1]
+    if mode == "encoded_grid":
+        return gym.spaces.Box(low=0.0, high=1.0, shape=(grid_size, grid_size, 1), dtype=np.float32)
+
+    # CASE 3: ENCODED GRID + AGENT POSITION – flat vector
+    if mode == "encoded_with_pos":
+        return gym.spaces.Box(low=0.0, high=1.0, shape=(grid_size * grid_size + 3,), dtype=np.float32)
+
+    # CASE 4: FULL MODE (default) - agent sees entire map
     return gym.spaces.Box(low=0, high=255, shape=(grid_size, grid_size, 3), dtype=np.uint8)
 
 
@@ -118,12 +155,19 @@ def observation(grid: np.ndarray):
     # Check which observation mode is active
     mode = _get_observation_mode()
 
-    # CASE 1: FULL GRID MODE - return the entire map as-is
+    # CASE 1: FULL GRID MODE
     if mode == "full_grid":
-        # Simply convert the grid (10x10x3 RGB array) to uint8 type and return it
         return grid.astype(np.uint8)
 
-    # CASE 2: PARTIAL GRID MODE - return only cells visible to the agent
+    # CASE 2: ENCODED GRID
+    if mode == "encoded_grid":
+        return _encode_grid(grid)
+
+    # CASE 3: ENCODED GRID + AGENT POSITION
+    if mode == "encoded_with_pos":
+        return _encode_grid_with_pos(grid)
+
+    # CASE 4: PARTIAL GRID MODE - return only cells visible to the agent
     # This is used when agent has limited vision
 
     # Make sure the environment reference was stored (should be set in observation_space())
@@ -318,7 +362,8 @@ def reward_hidden(info: dict) -> float:
 
 
     # If agent is in the field of view of any enemy, give a penalty. Otherwise, give a small reward for being hidden.
-    if agent_pos_tup in [cell for enemy in enemies for cell in enemy.fov_cells]:
+    all_fov = [cell for enemy in enemies for cell in enemy.get_fov_cells()]
+    if agent_pos_tup in all_fov:
         reward -= 1
     else:
         reward += 0.1
@@ -330,6 +375,78 @@ def reward_hidden(info: dict) -> float:
     return reward
 
 
+def reward_smart(info: dict) -> float:
+    """
+    Improved reward combining survival bonus, new-cell reward,
+    FOV proximity penalty, and revisit penalty.
+    """
+    enemies          = info["enemies"]
+    agent_pos        = info["agent_pos"]
+    new_cell_covered = info["new_cell_covered"]
+    game_over        = info["game_over"]
+    cells_remaining  = info["cells_remaining"]
+
+    r = 0.01  # survival bonus per step
+
+    if new_cell_covered:
+        r += 1.0
+    else:
+        r -= 0.1  # revisit / idle penalty
+
+    if game_over:
+        r -= 10.0
+
+    # Proximity warning: penalise being inside any enemy's FOV
+    agent_row = agent_pos // 10
+    agent_col = agent_pos % 10
+    in_fov = (agent_row, agent_col) in [cell for e in enemies for cell in e.get_fov_cells()]
+    if in_fov:
+        r -= 0.5
+
+    if cells_remaining == 0:
+        r += 50.0
+
+    return r
+
+
+def reward_momentum(info: dict) -> float:
+    """
+    Momentum reward: scales up coverage rewards as the agent
+    gets deeper into the map.
+    """
+    enemies          = info["enemies"]
+    agent_pos        = info["agent_pos"]
+    new_cell_covered = info["new_cell_covered"]
+    game_over        = info["game_over"]
+    cells_remaining  = info["cells_remaining"]
+    total_covered    = info["total_covered_cells"]
+    coverable        = info.get("coverable_cells", 1) or 1
+
+    r = 0.01  # survival bonus
+
+    if new_cell_covered:
+        # Base reward of +1.0, plus up to +3.0 based on % of map covered
+        coverage_ratio = total_covered / coverable
+        r += 1.0 + (coverage_ratio * 3.0)
+    else:
+        r -= 0.1  # idle/revisit penalty
+
+    if game_over:
+        r -= 10.0
+
+    # FOV penalty
+    agent_row = agent_pos // 10
+    agent_col = agent_pos % 10
+    in_fov = (agent_row, agent_col) in [cell for e in enemies for cell in e.get_fov_cells()]
+    if in_fov:
+        r -= 0.5
+
+    if cells_remaining == 0:
+        r += 50.0
+
+    return r
+
+
 def reward(info: dict) -> float:
     """
     Default reward hook expected by env.py.
@@ -337,13 +454,21 @@ def reward(info: dict) -> float:
     - explore (default)
     - efficiency
     - hidden
+    - smart
+    - momentum
     """
     mode = _get_reward_mode()
     if mode == "efficiency":
         return reward_efficiency(info)
     if mode == "hidden":
         return reward_hidden(info)
+    if mode == "smart":
+        return reward_smart(info)
+    if mode == "momentum":
+        return reward_momentum(info)
     return reward_explore(info)
+
+
 import os
 import numpy as np
 import gymnasium as gym
@@ -432,9 +557,15 @@ def observation_space(env: gym.Env) -> gym.spaces.Space:
         #shape = The shape of the observation. For a full RGB grid, this would be (grid_size, grid_size, 3). For a partial window, this would be (window, window, 3).
         #dtype = The data type of the observation. For RGB values, this is typically np.uint8, which allows values from 0 to 255.
 
-    # CASE 2: FULL MODE (default) - agent sees entire map
-    # Shape: (grid_size, grid_size, 3) = (10, 10, 3) for full RGB grid
-    # Values: 0-255 (standard RGB byte range)
+    # CASE 2: ENCODED GRID
+    if mode == "encoded_grid":
+        return gym.spaces.Box(low=0.0, high=1.0, shape=(grid_size, grid_size, 1), dtype=np.float32)
+
+    # CASE 3: ENCODED GRID + AGENT POSITION
+    if mode == "encoded_with_pos":
+        return gym.spaces.Box(low=0.0, high=1.0, shape=(grid_size * grid_size + 3,), dtype=np.float32)
+
+    # CASE 4: FULL MODE (default)
     return gym.spaces.Box(low=0, high=255, shape=(grid_size, grid_size, 3), dtype=np.uint8)
 
 
@@ -447,12 +578,19 @@ def observation(grid: np.ndarray):
     # Check which observation mode is active
     mode = _get_observation_mode()
     
-    # CASE 1: FULL GRID MODE - return the entire map as-is
+    # CASE 1: FULL GRID MODE
     if mode == "full_grid":
-        # Simply convert the grid (10x10x3 RGB array) to uint8 type and return it
         return grid.astype(np.uint8)
 
-    # CASE 2: PARTIAL GRID MODE - return only cells visible to the agent
+    # CASE 2: ENCODED GRID
+    if mode == "encoded_grid":
+        return _encode_grid(grid)
+
+    # CASE 3: ENCODED GRID + AGENT POSITION
+    if mode == "encoded_with_pos":
+        return _encode_grid_with_pos(grid)
+
+    # CASE 4: PARTIAL GRID MODE - return only cells visible to the agent
     # This is used when agent has limited vision
     
     # Make sure the environment reference was stored (should be set in observation_space())
